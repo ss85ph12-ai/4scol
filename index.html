@@ -395,7 +395,7 @@
     <div id="pay-staff-modal" class="modal" style="z-index: 2000;">
         <div class="modal-content glass">
             <span class="close-btn" onclick="hideModal('pay-staff-modal')">&times;</span>
-            <h3><i class="fas fa-hand-holding-usd"></i> صرف راتب إداري (نظام تفاعلي)</h3>
+            <h3 id="staff-pay-modal-title"><i class="fas fa-hand-holding-usd"></i> صرف راتب إداري (نظام تفاعلي)</h3>
             <div class="grid-2 mt-2 mb-1 text-center">
                 <div class="glass p-2">سنوات الخدمة<br><b id="staff-pay-years" style="color:#3498db;">0</b></div>
                 <div class="glass p-2">إضافة الخدمة<br><b id="staff-pay-service-total" style="color:#2ecc71;">0</b></div>
@@ -412,14 +412,14 @@
                 <span style="font-weight:bold;">الصافي المستحق:</span>
                 <b id="staff-pay-net" style="color:#e74c3c; font-size:20px;">0</b>
             </div>
-            <button type="button" class="btn-3d success w-100" onclick="submitStaffPayment()"><i class="fas fa-check"></i> تأكيد الدفع</button>
+            <button type="button" id="staff-pay-submit" class="btn-3d success w-100" onclick="submitStaffPayment()"><i class="fas fa-check"></i> تأكيد الدفع</button>
         </div>
     </div>
 
     <div id="pay-teacher-modal" class="modal" style="z-index: 2000;">
         <div class="modal-content glass">
             <span class="close-btn" onclick="hideModal('pay-teacher-modal')">&times;</span>
-            <h3><i class="fas fa-hand-holding-usd"></i> صرف راتب مدرس (نظام تفاعلي)</h3>
+            <h3 id="teach-pay-modal-title"><i class="fas fa-hand-holding-usd"></i> صرف راتب مدرس (نظام تفاعلي)</h3>
             <div class="grid-2 mt-2 mb-1 text-center">
                 <div class="glass p-2">سنوات الخدمة<br><b id="teach-pay-years" style="color:#3498db;">0</b></div>
                 <div class="glass p-2">إضافة الخدمة<br><b id="teach-pay-service-total" style="color:#2ecc71;">0</b></div>
@@ -428,17 +428,21 @@
                 <input type="number" id="teach-pay-price" class="glass-input" placeholder="سعر المحاضرة (د.ع)" oninput="calcTeacherSalary()">
                 <input type="number" id="teach-pay-service-amount" class="glass-input" placeholder="مبلغ سنة الخدمة (د.ع)" oninput="calcTeacherSalary()">
                 <input type="number" id="teach-pay-lecs" class="glass-input" placeholder="عدد المحاضرات الشهرية" oninput="calcTeacherSalary()">
-                <input type="number" id="teach-pay-stds" class="glass-input" placeholder="عدد الطلاب (للمعلومة فقط)" oninput="calcTeacherSalary()">
+                <input type="number" id="teach-pay-stds" class="glass-input" placeholder="عدد الطلاب (يُضاف للراتب الأساسي)" oninput="calcTeacherSalary()">
                 <input type="number" id="teach-pay-eval" class="glass-input" placeholder="التقييم (من 150)" oninput="calcTeacherSalary()">
                 <input type="number" id="teach-pay-bonus" class="glass-input" placeholder="مكافأة إضافية (إن وجد)" oninput="calcTeacherSalary()">
             </div>
             <input type="number" id="teach-pay-deduct" class="glass-input" placeholder="الخصم (إن وجد)" oninput="calcTeacherSalary()">
             <input type="date" id="teach-pay-date" class="glass-input">
+            <div class="list-item flex-between mb-2 mt-1" style="background:rgba(52, 152, 219, 0.1); border-color:#3498db;">
+                <span style="font-weight:bold;">الراتب الأساسي:</span>
+                <b id="teach-pay-base" style="color:#3498db; font-size:20px;">0</b>
+            </div>
             <div class="list-item flex-between mb-2 mt-1" style="background:rgba(231, 76, 60, 0.1); border-color:#e74c3c;">
                 <span style="font-weight:bold;">الصافي المستحق:</span>
                 <b id="teach-pay-net" style="color:#e74c3c; font-size:20px;">0</b>
             </div>
-            <button type="button" class="btn-3d success w-100" onclick="submitTeacherPayment()"><i class="fas fa-check"></i> تأكيد الدفع</button>
+            <button type="button" id="teach-pay-submit" class="btn-3d success w-100" onclick="submitTeacherPayment()"><i class="fas fa-check"></i> تأكيد الدفع</button>
         </div>
     </div>
 

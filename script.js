@@ -10,6 +10,145 @@ try {
     db = null;
 }
 
+// ============ حماية المزامنة من استبدال بيانات الأجهزة الأخرى ============
+// نحتفظ بآخر نسخة تمت قراءتها/مزامنتها، ثم ندمج تغييرات هذا الجهاز
+// مع أحدث نسخة سحابية قبل أي كتابة. هذا يمنع جهازاً قديماً من مسح
+// طلاب أُضيفوا من جهاز آخر لمجرد حفظ دفعة أو تعديل إعداد.
+let lastSyncedDb = null;
+let saveQueue = Promise.resolve();
+let saveSequence = 0;
+const yearSnapshots = Object.create(null);
+
+function cloneData(value) {
+    if (value === undefined) return undefined;
+    return JSON.parse(JSON.stringify(value));
+}
+
+function isPlainObject(value) {
+    return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function dataEqual(a, b) {
+    if (a === b) return true;
+    if (typeof a !== typeof b || a === null || b === null) return false;
+    if (Array.isArray(a)) {
+        if (!Array.isArray(b) || a.length !== b.length) return false;
+        for (let i = 0; i < a.length; i++) if (!dataEqual(a[i], b[i])) return false;
+        return true;
+    }
+    if (isPlainObject(a)) {
+        if (!isPlainObject(b)) return false;
+        const ak = Object.keys(a), bk = Object.keys(b);
+        if (ak.length !== bk.length) return false;
+        for (const key of ak) {
+            if (!Object.prototype.hasOwnProperty.call(b, key) || !dataEqual(a[key], b[key])) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+function getArrayItemKey(item) {
+    if (!isPlainObject(item)) return null;
+    if (item.id !== undefined && item.id !== null && item.id !== '') return 'id:' + String(item.id);
+    if (item.receiptNo !== undefined && item.receiptNo !== null && item.receiptNo !== '') return 'receipt:' + String(item.receiptNo);
+    if (item.regId !== undefined && item.regId !== null && item.regId !== '') return 'reg:' + String(item.regId);
+    // الإخوة وبعض السجلات القديمة قد لا تملك id، لذلك نستخدم الاسم كحل أخير.
+    if (item.name !== undefined && item.name !== null && item.name !== '') return 'name:' + String(item.name).trim();
+    return null;
+}
+
+function canMergeArrayByKey(arrays) {
+    const objects = arrays.flat().filter(v => v !== undefined && v !== null);
+    return objects.length > 0 && objects.every(v => getArrayItemKey(v) !== null);
+}
+
+function mergeArrayByKey(base, local, remote) {
+    const toMap = arr => {
+        const map = new Map();
+        (arr || []).forEach(item => map.set(getArrayItemKey(item), item));
+        return map;
+    };
+    const baseMap = toMap(base), localMap = toMap(local), remoteMap = toMap(remote);
+    const orderedKeys = [];
+    const seen = new Set();
+    [remote || [], local || [], base || []].forEach(arr => arr.forEach(item => {
+        const key = getArrayItemKey(item);
+        if (!seen.has(key)) { seen.add(key); orderedKeys.push(key); }
+    }));
+
+    const result = [];
+    orderedKeys.forEach(key => {
+        const bHas = baseMap.has(key), lHas = localMap.has(key), rHas = remoteMap.has(key);
+        const b = baseMap.get(key), l = localMap.get(key), r = remoteMap.get(key);
+
+        if (bHas) {
+            // حذف محلي صريح: لا نعيد السجل من النسخة السحابية.
+            if (!lHas) return;
+            // حذف سحابي مع عدم وجود تعديل محلي: نحترم الحذف السحابي.
+            if (!rHas) {
+                if (!dataEqual(l, b)) result.push(cloneData(l));
+                return;
+            }
+            result.push(mergeThreeWay(b, l, r));
+            return;
+        }
+
+        // سجل جديد بعد النسخة الأساسية: نحافظ على إضافات كلا الجهازين.
+        if (lHas && rHas) result.push(mergeThreeWay(undefined, l, r));
+        else if (lHas) result.push(cloneData(l));
+        else if (rHas) result.push(cloneData(r));
+    });
+    return result;
+}
+
+function mergeObjects(base, local, remote) {
+    const b = isPlainObject(base) ? base : {};
+    const l = isPlainObject(local) ? local : {};
+    const r = isPlainObject(remote) ? remote : {};
+    const keys = new Set([...Object.keys(b), ...Object.keys(l), ...Object.keys(r)]);
+    const out = {};
+
+    keys.forEach(key => {
+        const bHas = Object.prototype.hasOwnProperty.call(b, key);
+        const lHas = Object.prototype.hasOwnProperty.call(l, key);
+        const rHas = Object.prototype.hasOwnProperty.call(r, key);
+
+        if (bHas) {
+            if (!lHas) return; // حذف محلي صريح
+            if (!rHas) {
+                if (!dataEqual(l[key], b[key])) out[key] = cloneData(l[key]);
+                return;
+            }
+            out[key] = mergeThreeWay(b[key], l[key], r[key]);
+        } else {
+            if (lHas && rHas) out[key] = mergeThreeWay(undefined, l[key], r[key]);
+            else if (lHas) out[key] = cloneData(l[key]);
+            else if (rHas) out[key] = cloneData(r[key]);
+        }
+    });
+    return out;
+}
+
+function mergeThreeWay(base, local, remote) {
+    // لم يغيّر هذا الجهاز القيمة: نأخذ أحدث قيمة سحابية.
+    if (dataEqual(local, base)) return cloneData(remote);
+    // لم تتغير القيمة سحابياً: نأخذ تعديل هذا الجهاز.
+    if (dataEqual(remote, base)) return cloneData(local);
+
+    if (Array.isArray(local) && Array.isArray(remote)) {
+        const b = Array.isArray(base) ? base : [];
+        if (canMergeArrayByKey([b, local, remote])) return mergeArrayByKey(b, local, remote);
+        // المصفوفات البسيطة مثل أسماء المواد: عند التعارض نأخذ تعديل الجهاز الحالي.
+        return cloneData(local);
+    }
+    if (isPlainObject(local) && isPlainObject(remote)) {
+        return mergeObjects(base, local, remote);
+    }
+    // تعارض على قيمة مفردة؛ تعديل المستخدم الحالي هو المقصود.
+    return cloneData(local);
+}
+
 let dObj = new Date();
 let todayISO = dObj.getFullYear() + '-' + String(dObj.getMonth() + 1).padStart(2, '0') + '-' + String(dObj.getDate()).padStart(2, '0');
 
@@ -17,6 +156,8 @@ const defaultSubjects = ['العربي','الرياضيات','الإنكليزي
 
 let currentStudentId = null, editingStudentId = null, tempSiblings = [], editingStaffId = null, currentTeacherId = null, currentStaffPaymentId = null;
 let editingPaymentIndex = null;
+let editingTeacherPaymentIndex = null, editingStaffPaymentIndex = null;
+let teacherPaymentServiceYears = null, staffPaymentServiceYears = null;
 let editingDirectSibMainId = null, editingDirectSibIdx = null, editingTempSibIdx = null;
 
 // ============ 2. محرك التنبيهات 3D (SweetAlert2) ============
@@ -175,6 +316,10 @@ async function startApp() {
             regions: [], students: [], staff: [], expenses: [], recycleBin: []
         };
     }
+
+    // هذه هي النسخة الأساسية التي سنقارن بها أي تعديل لاحق.
+    lastSyncedDb = cloneData(db);
+    if(currentYear) yearSnapshots[currentYear] = cloneData(db);
     
     applyTheme(db.theme);
     if (!db.schoolName || db.schoolName.trim() === '') { 
@@ -195,14 +340,63 @@ window.onload = () => {
     }
 };
 
-function saveDB() { 
-    if(!currentYear) return;
-    localStorage.setItem(APP_CONFIG.DB_KEY + "_" + currentYear, JSON.stringify(db)); 
-    if (window.firebaseReady && window.fsDb) {
-        const docRef = window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + currentYear);
-        window.fsSetDoc(docRef, db).catch(e => console.error("خطأ أثناء المزامنة السحابية:", e));
+function saveDB() {
+    if(!currentYear) return Promise.resolve(false);
+
+    const yearAtSave = currentYear;
+    const storageKey = APP_CONFIG.DB_KEY + "_" + yearAtSave;
+    const desiredDb = cloneData(db);
+    const baseDb = cloneData(lastSyncedDb || yearSnapshots[yearAtSave] || desiredDb);
+    const sequence = ++saveSequence;
+
+    // الحفظ المحلي فوري حتى لا تضيع العملية عند انقطاع الإنترنت.
+    localStorage.setItem(storageKey, JSON.stringify(desiredDb));
+
+    if (!(window.firebaseReady && window.fsDb)) {
+        // لا نعتبرها نسخة سحابية مؤكدة، لكنها أساس محلي مؤقت إلى حين رجوع الإنترنت.
+        return Promise.resolve(false);
     }
+
+    // ترتيب عمليات الحفظ يمنع وصول كتابة أقدم بعد كتابة أحدث من الجهاز نفسه.
+    saveQueue = saveQueue.then(async () => {
+        try {
+            const docRef = window.fsDoc(window.fsDb, "schools", storageKey);
+            let remoteDb = null;
+            try {
+                const snap = await window.fsGetDoc(docRef);
+                if (snap.exists()) remoteDb = snap.data();
+            } catch (readError) {
+                console.warn("تعذر قراءة أحدث نسخة قبل الحفظ؛ تم إيقاف الكتابة لحماية البيانات:", readError);
+                return false;
+            }
+
+            const mergedDb = remoteDb
+                ? mergeThreeWay(baseDb, desiredDb, remoteDb)
+                : desiredDb;
+
+            await window.fsSetDoc(docRef, mergedDb);
+            lastSyncedDb = cloneData(mergedDb);
+            yearSnapshots[yearAtSave] = cloneData(mergedDb);
+
+            // لا نستبدل حالة الشاشة إذا حدث حفظ أحدث أثناء انتظار الشبكة.
+            if (sequence === saveSequence && currentYear === yearAtSave) {
+                db = cloneData(mergedDb);
+                localStorage.setItem(storageKey, JSON.stringify(mergedDb));
+            }
+            return true;
+        } catch(e) {
+            console.error("خطأ أثناء المزامنة السحابية، بقيت النسخة محفوظة محلياً:", e);
+            return false;
+        }
+    });
+
+    return saveQueue;
 }
+
+// عند رجوع الإنترنت نحاول رفع التغييرات المحلية بطريقة الدمج الآمن نفسها.
+window.addEventListener('online', () => {
+    if (currentYear && db && window.firebaseReady && window.fsDb) saveDB();
+});
 
 function saveSetup() {
     let name = document.getElementById('setup-school-name').value;
@@ -256,11 +450,13 @@ function initApp() {
     if(!db.recycleBin) db.recycleBin = [];
 
     let now = Date.now();
+    const recycleCountBeforeCleanup = db.recycleBin.length;
     db.recycleBin = db.recycleBin.filter(s => {
         let diffDays = (now - (s.deletedAt || now)) / (1000 * 3600 * 24);
         return diffDays <= 15;
     });
-    saveDB();
+    // لا نحفظ المستند كاملاً لمجرد فتح النظام. نحفظ فقط عند حذف عناصر منتهية فعلياً.
+    if (db.recycleBin.length !== recycleCountBeforeCleanup) saveDB();
     
     document.getElementById('display-school-name').innerHTML = `<i class="fas fa-university"></i> ${db.schoolName}`;
     document.getElementById('edit-school-name').value = db.schoolName; 
@@ -391,27 +587,54 @@ function addNewYear() {
 
 async function getTargetYearDB(year) {
     let targetDb = null;
-    try { 
-        let local = localStorage.getItem(APP_CONFIG.DB_KEY + "_" + year);
-        if(local) targetDb = JSON.parse(local); 
-    } catch(e){}
-    
-    if(!targetDb && window.firebaseReady && window.fsDb) {
+    const storageKey = APP_CONFIG.DB_KEY + "_" + year;
+
+    // السحابة أولاً: النسخة المحلية قد تكون قديمة وتسبب اختفاء طلاب السنة المستهدفة.
+    if(window.firebaseReady && window.fsDb) {
         try {
-            let snap = await window.fsGetDoc(window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + year));
-            if(snap.exists()) targetDb = snap.data();
-        } catch(e) { console.error("Error fetching target DB:", e); }
+            const snap = await window.fsGetDoc(window.fsDoc(window.fsDb, "schools", storageKey));
+            if(snap.exists()) {
+                targetDb = snap.data();
+                localStorage.setItem(storageKey, JSON.stringify(targetDb));
+            }
+        } catch(e) {
+            console.warn("تعذر جلب أحدث بيانات السنة المستهدفة، سيتم استخدام النسخة المحلية إن وجدت:", e);
+        }
     }
+
+    if(!targetDb) {
+        try {
+            const local = localStorage.getItem(storageKey);
+            if(local) targetDb = JSON.parse(local);
+        } catch(e){}
+    }
+
+    if(targetDb) yearSnapshots[year] = cloneData(targetDb);
     return targetDb;
 }
 
 async function saveTargetYearDB(year, targetDb) {
-    localStorage.setItem(APP_CONFIG.DB_KEY + "_" + year, JSON.stringify(targetDb));
+    const storageKey = APP_CONFIG.DB_KEY + "_" + year;
+    const desiredDb = cloneData(targetDb);
+    const baseDb = cloneData(yearSnapshots[year] || desiredDb);
+    localStorage.setItem(storageKey, JSON.stringify(desiredDb));
+
     if(window.firebaseReady && window.fsDb) {
         try {
-            await window.fsSetDoc(window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + year), targetDb);
-        } catch(e) { console.error("Error saving target DB:", e); }
+            const docRef = window.fsDoc(window.fsDb, "schools", storageKey);
+            const snap = await window.fsGetDoc(docRef);
+            const remoteDb = snap.exists() ? snap.data() : null;
+            const mergedDb = remoteDb ? mergeThreeWay(baseDb, desiredDb, remoteDb) : desiredDb;
+            await window.fsSetDoc(docRef, mergedDb);
+            yearSnapshots[year] = cloneData(mergedDb);
+            localStorage.setItem(storageKey, JSON.stringify(mergedDb));
+            return mergedDb;
+        } catch(e) {
+            console.error("تعذر حفظ السنة المستهدفة سحابياً؛ بقيت النسخة محلياً:", e);
+            return desiredDb;
+        }
     }
+    return desiredDb;
 }
 // ===============================================
 
@@ -1125,6 +1348,11 @@ function paymentMatchesMonth(dateValue, monthKey) {
     }
     return false;
 }
+function findPaymentInMonth(st, dateValue, excludedIndex = null) {
+    if(!st || !Array.isArray(st.payments) || !dateValue) return -1;
+    let monthKey = String(dateValue).slice(0, 7);
+    return st.payments.findIndex((payment, index) => index !== excludedIndex && paymentMatchesMonth(payment.date, monthKey));
+}
 function openAddStaffModal() { editingStaffId=null; document.getElementById('staff-modal-title').innerHTML='<i class="fas fa-user-plus"></i> إضافة موظف'; ['staff-name','staff-role','staff-salary','staff-start-date'].forEach(id=>document.getElementById(id).value=''); showModal('add-staff-modal'); }
 function saveStaff() { let n=document.getElementById('staff-name').value, r=document.getElementById('staff-role').value, startDate=document.getElementById('staff-start-date').value, s=parseFloat(document.getElementById('staff-salary').value)||0; if(!n||s<=0) return customAlert('يرجى إدخال الاسم والراتب بشكل صحيح', 'error'); if(editingStaffId){ let idx=db.staff.findIndex(x=>x.id===editingStaffId); db.staff[idx].name=n; db.staff[idx].role=r; db.staff[idx].startDate=startDate; db.staff[idx].hiringYear=getYearFromDate(startDate, db.staff[idx].hiringYear || new Date().getFullYear()); db.staff[idx].salary=s; } else { db.staff.push({ id:Date.now(), name:n, role:r, startDate:startDate, hiringYear:getYearFromDate(startDate), salary:s, isTeacher:false, payments:[] }); } saveDB(); hideModal('add-staff-modal'); renderStaff(); renderDual(); if(typeof Swal !== 'undefined') Swal.fire({toast:true, position:'top-end', icon:'success', title:'تم الحفظ', showConfirmButton:false, timer:1500}); }
 function editStaff(id) { editingStaffId=id; let s=db.staff.find(x=>x.id===id); document.getElementById('staff-modal-title').innerHTML='<i class="fas fa-edit"></i> تعديل موظف'; document.getElementById('staff-name').value=s.name; document.getElementById('staff-role').value=s.role; document.getElementById('staff-start-date').value=s.startDate||''; document.getElementById('staff-salary').value=s.salary; showModal('add-staff-modal'); }
@@ -1135,14 +1363,23 @@ function editTeacher(id) { editingStaffId=id; let s=db.staff.find(x=>x.id===id);
 
 function deleteStaff(id) { customConfirm("تأكيد حذف الموظف/المدرس وكل سجلات مدفوعاته؟", r=>{ if(r){db.staff=db.staff.filter(x=>x.id!==id); saveDB(); renderStaff(); renderDual(); renderDaily();} }); }
 
-function payStaff(id) {
+function payStaff(id, paymentIndex = null) {
     currentStaffPaymentId = id;
     let st = db.staff.find(x => x.id === id);
     if(!st) return;
 
-    document.getElementById('staff-pay-salary').value = st.salary || '';
-    ['staff-pay-students','staff-pay-service-amount','staff-pay-bonus','staff-pay-deduct'].forEach(el => document.getElementById(el).value = '');
-    document.getElementById('staff-pay-date').value = todayISO;
+    editingStaffPaymentIndex = Number.isInteger(paymentIndex) ? paymentIndex : null;
+    let payment = editingStaffPaymentIndex !== null && Array.isArray(st.payments) ? st.payments[editingStaffPaymentIndex] : null;
+    staffPaymentServiceYears = payment && Number.isFinite(Number(payment.serviceYears)) ? Number(payment.serviceYears) : null;
+
+    document.getElementById('staff-pay-salary').value = payment ? (payment.nominalSalary ?? payment.amount ?? '') : (st.salary || '');
+    document.getElementById('staff-pay-students').value = payment ? (payment.students || '') : '';
+    document.getElementById('staff-pay-service-amount').value = payment ? (payment.serviceAmount || '') : '';
+    document.getElementById('staff-pay-bonus').value = payment ? (payment.bonus || '') : '';
+    document.getElementById('staff-pay-deduct').value = payment ? (payment.deduct || '') : '';
+    document.getElementById('staff-pay-date').value = payment ? (payment.date || todayISO) : todayISO;
+    document.getElementById('staff-pay-modal-title').innerHTML = payment ? '<i class="fas fa-edit"></i> تعديل راتب إداري' : '<i class="fas fa-hand-holding-usd"></i> صرف راتب إداري (نظام تفاعلي)';
+    document.getElementById('staff-pay-submit').innerHTML = payment ? '<i class="fas fa-save"></i> حفظ تعديل الراتب' : '<i class="fas fa-check"></i> تأكيد الدفع';
     calcStaffSalary();
     showModal('pay-staff-modal');
 }
@@ -1152,7 +1389,7 @@ function calcStaffSalary() {
     let st = db.staff.find(x => x.id === currentStaffPaymentId);
     if(!st) return 0;
 
-    let serviceYears = getServiceYears(st);
+    let serviceYears = staffPaymentServiceYears !== null ? staffPaymentServiceYears : getServiceYears(st);
     document.getElementById('staff-pay-years').innerText = serviceYears;
 
     let nominalSalary = parseFloat(document.getElementById('staff-pay-salary').value) || 0;
@@ -1175,44 +1412,80 @@ function submitStaffPayment() {
     let st = db.staff.find(x => x.id === currentStaffPaymentId);
     if(net > 0 && dt && st) {
         if(!Array.isArray(st.payments)) st.payments = [];
-        st.payments.push({amount: net, date: dt});
+        if(findPaymentInMonth(st, dt, editingStaffPaymentIndex) !== -1) {
+            return customAlert('يوجد راتب مسجل لهذا الموظف في الشهر نفسه. افتح الدفعة السابقة واضغط تعديل.', 'warning');
+        }
+        let payment = {
+            amount: net,
+            date: dt,
+            nominalSalary: parseFloat(document.getElementById('staff-pay-salary').value) || 0,
+            students: parseFloat(document.getElementById('staff-pay-students').value) || 0,
+            serviceAmount: parseFloat(document.getElementById('staff-pay-service-amount').value) || 0,
+            bonus: parseFloat(document.getElementById('staff-pay-bonus').value) || 0,
+            deduct: parseFloat(document.getElementById('staff-pay-deduct').value) || 0,
+            serviceYears: staffPaymentServiceYears !== null ? staffPaymentServiceYears : getServiceYears(st)
+        };
+        let isEditing = editingStaffPaymentIndex !== null && st.payments[editingStaffPaymentIndex];
+        if(isEditing) st.payments[editingStaffPaymentIndex] = {...st.payments[editingStaffPaymentIndex], ...payment};
+        else st.payments.push(payment);
         saveDB();
         hideModal('pay-staff-modal');
         renderStaff(); renderDual(); renderDaily();
-        if(typeof Swal !== 'undefined') Swal.fire({toast:true, position:'top-end', icon:'success', title:'تم صرف راتب الإداري بنجاح', showConfirmButton:false, timer:1500});
+        if(typeof Swal !== 'undefined') Swal.fire({toast:true, position:'top-end', icon:'success', title:isEditing ? 'تم تعديل راتب الإداري' : 'تم صرف راتب الإداري بنجاح', showConfirmButton:false, timer:1500});
         currentStaffPaymentId = null;
+        editingStaffPaymentIndex = null;
+        staffPaymentServiceYears = null;
     } else {
         customAlert("الصافي يجب أن يكون أكبر من صفر والتاريخ مطلوب", "error");
     }
 }
 
-function payTeacher(id) {
+function payTeacher(id, paymentIndex = null) {
     currentTeacherId = id;
-    ['teach-pay-price','teach-pay-service-amount','teach-pay-lecs','teach-pay-stds','teach-pay-eval','teach-pay-bonus','teach-pay-deduct'].forEach(el=>document.getElementById(el).value='');
-    document.getElementById('teach-pay-date').value = todayISO;
+    let st = db.staff.find(x => x.id === id);
+    if(!st) return;
+
+    editingTeacherPaymentIndex = Number.isInteger(paymentIndex) ? paymentIndex : null;
+    let payment = editingTeacherPaymentIndex !== null && Array.isArray(st.payments) ? st.payments[editingTeacherPaymentIndex] : null;
+    let hasSavedDetails = payment && ['lecPrice','serviceAmount','monthlyLecs','students','evalPts','bonus','deduct'].some(key => Object.prototype.hasOwnProperty.call(payment, key));
+    teacherPaymentServiceYears = payment && Number.isFinite(Number(payment.serviceYears)) ? Number(payment.serviceYears) : null;
+
+    document.getElementById('teach-pay-price').value = payment ? (payment.lecPrice || '') : '';
+    document.getElementById('teach-pay-service-amount').value = payment ? (payment.serviceAmount || '') : '';
+    document.getElementById('teach-pay-lecs').value = payment ? (payment.monthlyLecs || '') : '';
+    document.getElementById('teach-pay-stds').value = payment ? (payment.students || '') : '';
+    document.getElementById('teach-pay-eval').value = payment ? (payment.evalPts || '') : '';
+    document.getElementById('teach-pay-bonus').value = payment ? (hasSavedDetails ? (payment.bonus || '') : (payment.amount || '')) : '';
+    document.getElementById('teach-pay-deduct').value = payment ? (payment.deduct || '') : '';
+    document.getElementById('teach-pay-date').value = payment ? (payment.date || todayISO) : todayISO;
+    document.getElementById('teach-pay-modal-title').innerHTML = payment ? '<i class="fas fa-edit"></i> تعديل راتب مدرس' : '<i class="fas fa-hand-holding-usd"></i> صرف راتب مدرس (نظام تفاعلي)';
+    document.getElementById('teach-pay-submit').innerHTML = payment ? '<i class="fas fa-save"></i> حفظ تعديل الراتب' : '<i class="fas fa-check"></i> تأكيد الدفع';
     calcTeacherSalary();
     showModal('pay-teacher-modal');
 }
 
 function calcTeacherSalary() {
-    if(!currentTeacherId) return;
+    if(currentTeacherId === null) return 0;
     let st = db.staff.find(x => x.id === currentTeacherId);
-    let serviceYears = getServiceYears(st);
+    if(!st) return 0;
+    let serviceYears = teacherPaymentServiceYears !== null ? teacherPaymentServiceYears : getServiceYears(st);
     
     document.getElementById('teach-pay-years').innerText = serviceYears;
     
     let lecPrice = parseFloat(document.getElementById('teach-pay-price').value) || 0;
     let serviceAmount = parseFloat(document.getElementById('teach-pay-service-amount').value) || 0;
     let monthlyLecs = parseFloat(document.getElementById('teach-pay-lecs').value) || 0;
+    let students = parseFloat(document.getElementById('teach-pay-stds').value) || 0;
     let evalPts = parseFloat(document.getElementById('teach-pay-eval').value) || 0;
     let bonus = parseFloat(document.getElementById('teach-pay-bonus').value) || 0;
     let deduct = parseFloat(document.getElementById('teach-pay-deduct').value) || 0;
-    
-    let base = lecPrice * monthlyLecs;
+
+    let base = (lecPrice * monthlyLecs) + students;
     let serviceBonus = serviceYears * serviceAmount;
     let evalBonus = evalPts;
     let net = base + serviceBonus + evalBonus + bonus - deduct;
-    
+
+    document.getElementById('teach-pay-base').innerText = base.toLocaleString();
     document.getElementById('teach-pay-service-total').innerText = serviceBonus.toLocaleString();
     document.getElementById('teach-pay-net').innerText = net.toLocaleString();
     return net;
@@ -1221,10 +1494,32 @@ function calcTeacherSalary() {
 function submitTeacherPayment() {
     let net = calcTeacherSalary();
     let dt = document.getElementById('teach-pay-date').value;
-    if(net > 0 && dt) {
-        db.staff.find(x => x.id === currentTeacherId).payments.push({amount: net, date: dt});
+    let st = db.staff.find(x => x.id === currentTeacherId);
+    if(net > 0 && dt && st) {
+        if(!Array.isArray(st.payments)) st.payments = [];
+        if(findPaymentInMonth(st, dt, editingTeacherPaymentIndex) !== -1) {
+            return customAlert('يوجد راتب مسجل لهذا المدرس في الشهر نفسه. افتح الدفعة السابقة واضغط تعديل.', 'warning');
+        }
+        let payment = {
+            amount: net,
+            date: dt,
+            lecPrice: parseFloat(document.getElementById('teach-pay-price').value) || 0,
+            serviceAmount: parseFloat(document.getElementById('teach-pay-service-amount').value) || 0,
+            monthlyLecs: parseFloat(document.getElementById('teach-pay-lecs').value) || 0,
+            students: parseFloat(document.getElementById('teach-pay-stds').value) || 0,
+            evalPts: parseFloat(document.getElementById('teach-pay-eval').value) || 0,
+            bonus: parseFloat(document.getElementById('teach-pay-bonus').value) || 0,
+            deduct: parseFloat(document.getElementById('teach-pay-deduct').value) || 0,
+            serviceYears: teacherPaymentServiceYears !== null ? teacherPaymentServiceYears : getServiceYears(st)
+        };
+        let isEditing = editingTeacherPaymentIndex !== null && st.payments[editingTeacherPaymentIndex];
+        if(isEditing) st.payments[editingTeacherPaymentIndex] = {...st.payments[editingTeacherPaymentIndex], ...payment};
+        else st.payments.push(payment);
         saveDB(); hideModal('pay-teacher-modal'); renderStaff(); renderDual(); renderDaily();
-        if(typeof Swal !== 'undefined') Swal.fire({toast:true, position:'top-end', icon:'success', title:'تم صرف راتب المدرس بنجاح', showConfirmButton:false, timer:1500});
+        if(typeof Swal !== 'undefined') Swal.fire({toast:true, position:'top-end', icon:'success', title:isEditing ? 'تم تعديل راتب المدرس' : 'تم صرف راتب المدرس بنجاح', showConfirmButton:false, timer:1500});
+        currentTeacherId = null;
+        editingTeacherPaymentIndex = null;
+        teacherPaymentServiceYears = null;
     } else { customAlert("الصافي يجب أن يكون أكبر من صفر والتاريخ مطلوب", "error"); }
 }
 
@@ -1235,9 +1530,13 @@ function renderStaffPaymentHistory(st) {
 
     let rows = st.payments.map((payment, index) => {
         let amount = parseFloat(payment.amount) || 0;
+        let editAction = st.isTeacher ? `payTeacher(${st.id}, ${index})` : `payStaff(${st.id}, ${index})`;
         return `<div class="flex-between" style="padding:6px 8px; border-bottom:1px solid var(--glass-border); gap:10px;">
             <small><i class="far fa-calendar"></i> ${payment.date || '-'}</small>
-            <b style="color:#2ecc71;">${amount.toLocaleString()} د.ع</b>
+            <div class="flex-row">
+                <b style="color:#2ecc71;">${amount.toLocaleString()} د.ع</b>
+                <button type="button" class="btn-3d warning btn-small m-0" onclick="${editAction}"><i class="fas fa-edit"></i> تعديل</button>
+            </div>
         </div>`;
     }).join('');
 
@@ -1247,17 +1546,17 @@ function renderStaffPaymentHistory(st) {
     </details>`;
 }
 
-function renderStaff() { 
-    document.getElementById('staff-list').innerHTML = db.staff.map(st => { 
+function renderStaff() {
+    document.getElementById('staff-list').innerHTML = db.staff.map(st => {
         if(!Array.isArray(st.payments)) st.payments = [];
-        let paid = st.payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0); 
+        let paid = st.payments.reduce((s,p)=>s+(parseFloat(p.amount)||0),0);
         let startInfo = st.startDate ? ` | المباشرة: ${st.startDate}` : '';
         let serviceInfo = ` | الخدمة: ${getServiceYears(st)} سنة`;
         let paymentHistory = renderStaffPaymentHistory(st);
         if(st.isTeacher) {
             return `<div class="list-item" style="border-right: 4px solid #f39c12;"><div class="flex-between"><div><strong><i class="fas fa-chalkboard-teacher text-warning"></i> ${st.name}</strong> <small>(${st.role})</small><br><small>التعيين: ${st.hiringYear}${startInfo}${serviceInfo} | المصروف: <span style="color:#2ecc71">${paid.toLocaleString()}</span></small></div><div class="flex-row"><button type="button" class="btn-3d warning btn-small m-0" onclick="payTeacher(${st.id})"><i class="fas fa-calculator"></i> راتب تفاعلي</button> <button type="button" class="btn-3d btn-small m-0" style="background:#a777e3;" onclick="editTeacher(${st.id})"><i class="fas fa-pen"></i></button> <button type="button" class="btn-3d danger btn-small m-0" onclick="deleteStaff(${st.id})"><i class="fas fa-trash"></i></button></div></div>${paymentHistory}</div>`;
         } else {
-            return `<div class="list-item" style="border-right: 4px solid #3498db;"><div class="flex-between"><div><strong><i class="fas fa-user-tie text-primary"></i> ${st.name}</strong> <small>(${st.role})</small><br><small>الراتب المقطوع: ${st.salary.toLocaleString()}${startInfo}${serviceInfo} | المصروف: <span style="color:#2ecc71">${paid.toLocaleString()}</span> | الباقي: <span style="color:#e74c3c">${(st.salary-paid).toLocaleString()}</span></small></div><div class="flex-row"><button type="button" class="btn-3d success btn-small m-0" onclick="payStaff(${st.id})"><i class="fas fa-hand-holding-usd"></i> صرف</button> <button type="button" class="btn-3d warning btn-small m-0" onclick="editStaff(${st.id})"><i class="fas fa-pen"></i></button> <button type="button" class="btn-3d danger btn-small m-0" onclick="deleteStaff(${st.id})"><i class="fas fa-trash"></i></button></div></div>${paymentHistory}</div>`;
+            return `<div class="list-item" style="border-right: 4px solid #3498db;"><div class="flex-between"><div><strong><i class="fas fa-user-tie text-primary"></i> ${st.name}</strong> <small>(${st.role})</small><br><small>الراتب المقطوع: ${st.salary.toLocaleString()}${startInfo}${serviceInfo} | المصروف: <span style="color:#2ecc71">${paid.toLocaleString()}</span></small></div><div class="flex-row"><button type="button" class="btn-3d success btn-small m-0" onclick="payStaff(${st.id})"><i class="fas fa-hand-holding-usd"></i> صرف</button> <button type="button" class="btn-3d warning btn-small m-0" onclick="editStaff(${st.id})"><i class="fas fa-pen"></i></button> <button type="button" class="btn-3d danger btn-small m-0" onclick="deleteStaff(${st.id})"><i class="fas fa-trash"></i></button></div></div>${paymentHistory}</div>`;
         }
     }).join('') || '<div class="text-center mt-3">لا توجد بيانات</div>';
     renderStaffMonthlyReport();
@@ -1396,7 +1695,16 @@ function renderStatistics() {
 }
 
 // ============ 11. التقارير والطباعة ============
-function generateReport() { 
+function getFamilyReportPaidShare(mainStudent, memberIndex = 0) {
+    let familySize = 1 + (mainStudent.siblings || []).length;
+    let familyPaid = (mainStudent.payments || []).reduce((sum, payment) => sum + (parseFloat(payment.amount) || 0), 0);
+    let totalCents = Math.round(familyPaid * 100);
+    let baseCents = Math.floor(totalCents / familySize);
+    let extraCents = totalCents - (baseCents * familySize);
+    return (baseCents + (memberIndex < extraCents ? 1 : 0)) / 100;
+}
+
+function generateReport() {
     let cId=document.getElementById('rep-class').value, sId=document.getElementById('rep-section').value; 
     if(!cId||!sId){document.getElementById('report-list').innerHTML='';return;} 
     let f=db.students.filter(s=>s.classId==cId && s.sectionId==sId).map(s=>({...s, isSib:false})); 
@@ -1405,22 +1713,22 @@ function generateReport() {
     document.getElementById('report-list').innerHTML=f.map((s,i)=>`<div class="list-item"><b>${i+1}.</b> ${s.name} ${s.regId?`<small>(قيد: ${s.regId})</small>`:''} ${s.isSib?`<small style="color:red;">(أخ لـ ${s.mName})</small>`:''}</div>`).join(''); 
 }
 
-function exportReportExcel() { 
+function exportReportExcel() {
     try {
-        let cId=document.getElementById('rep-class').value, sId=document.getElementById('rep-section').value; 
-        let c=db.classes.find(x=>x.id==cId), s=c?c.sections.find(x=>x.id==sId):null; 
-        if(!c||!s) return customAlert('اختر الصف والشعبة', 'warning'); 
-        let f=db.students.filter(x=>x.classId==cId && x.sectionId==sId).map(x=>({...x, isSib:false, ph:x.phone})); 
-        db.students.forEach(m=>{ (m.siblings||[]).forEach(sib=>{ if(sib.classId==cId && sib.sectionId==sId) f.push({...sib, isSib:true, ph:m.phone, payments:Array.isArray(sib.payments)?sib.payments:(m.payments||[])}); }); });
-        f.sort((a,b)=>a.name.localeCompare(b.name,'ar')); 
-        let data=[[`تقرير الصف: ${c.name} - الشعبة: ${s.name}`],["التسلسل","اسم الطالب","رقم القيد","ملاحظة","الموبايل","عدد الدفعات","المبلغ المتبقي"]];
+        let cId=document.getElementById('rep-class').value, sId=document.getElementById('rep-section').value;
+        let c=db.classes.find(x=>x.id==cId), s=c?c.sections.find(x=>x.id==sId):null;
+        if(!c||!s) return customAlert('اختر الصف والشعبة', 'warning');
+        let f=db.students.filter(x=>x.classId==cId && x.sectionId==sId).map(x=>({...x, isSib:false, ph:x.phone, familyMain:x, familyMemberIndex:0}));
+        db.students.forEach(m=>{ (m.siblings||[]).forEach((sib,sibIndex)=>{ if(sib.classId==cId && sib.sectionId==sId) f.push({...sib, isSib:true, ph:m.phone, familyMain:m, familyMemberIndex:sibIndex+1}); }); });
+        f.sort((a,b)=>a.name.localeCompare(b.name,'ar'));
+        let data=[[`تقرير الصف: ${c.name} - الشعبة: ${s.name}`],["التسلسل","اسم الطالب","رقم القيد","ملاحظة","الموبايل","عدد الدفعات","حصة الطالب من المدفوع","المبلغ المتبقي"]];
         f.forEach((x,i)=>{
-            let payments = Array.isArray(x.payments) ? x.payments : [];
-            let paid = payments.reduce((sum,payment)=>sum+(parseFloat(payment.amount)||0),0);
+            let payments = Array.isArray(x.familyMain.payments) ? x.familyMain.payments : [];
+            let paid = getFamilyReportPaidShare(x.familyMain, x.familyMemberIndex);
             let totalFee = parseFloat(x.isSib ? x.fee : x.tuition) || 0;
-            data.push([i+1, x.name, x.regId||'', x.isSib?'أخ/أخت':'', x.ph||'', payments.length, totalFee-paid]);
+            data.push([i+1, x.name, x.regId||'', x.isSib?'أخ/أخت':'', x.ph||'', payments.length, paid, totalFee-paid]);
         });
-        let wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), "التقرير"); XLSX.writeFile(wb, `تقرير_${c.name}_${s.name}.xlsx`); 
+        let wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), "التقرير"); XLSX.writeFile(wb, `تقرير_${c.name}_${s.name}.xlsx`);
     } catch(e) { customAlert("تأكد من توفر الاتصال بالإنترنت لتحميل ملف الإكسل", "error"); }
 }
 
@@ -1443,22 +1751,22 @@ function exportDriverExcel() {
         let reg = db.regions.find(x => x.code === rCode); 
         if(!reg) return customAlert('اختر خط النقل أولاً', 'warning');
         
-        let f = db.students.filter(x => x.regionCode === rCode).map(x => ({...x, isSib:false, ph:x.phone}));
-        db.students.forEach(m => { 
-            (m.siblings||[]).forEach(sib => { 
-                if(m.regionCode === rCode) f.push({...sib, isSib:true, ph:m.phone, payments:Array.isArray(sib.payments)?sib.payments:(m.payments||[])});
-            }); 
+        let f = db.students.filter(x => x.regionCode === rCode).map(x => ({...x, isSib:false, ph:x.phone, familyMain:x, familyMemberIndex:0}));
+        db.students.forEach(m => {
+            (m.siblings||[]).forEach((sib,sibIndex) => {
+                if(m.regionCode === rCode) f.push({...sib, isSib:true, ph:m.phone, familyMain:m, familyMemberIndex:sibIndex+1});
+            });
         });
         f.sort((a,b)=>a.name.localeCompare(b.name,'ar'));
-        
-        let data = [[`تقرير خط النقل: ${reg.name} - السائق: ${reg.driver}`],["التسلسل","اسم الطالب","رقم القيد","ملاحظة","الموبايل","عدد الدفعات","المبلغ المتبقي"]];
+
+        let data = [[`تقرير خط النقل: ${reg.name} - السائق: ${reg.driver}`],["التسلسل","اسم الطالب","رقم القيد","ملاحظة","الموبايل","عدد الدفعات","حصة الطالب من المدفوع","المبلغ المتبقي"]];
         f.forEach((x,i)=>{
-            let payments = Array.isArray(x.payments) ? x.payments : [];
-            let paid = payments.reduce((sum,payment)=>sum+(parseFloat(payment.amount)||0),0);
+            let payments = Array.isArray(x.familyMain.payments) ? x.familyMain.payments : [];
+            let paid = getFamilyReportPaidShare(x.familyMain, x.familyMemberIndex);
             let totalFee = parseFloat(x.isSib ? x.fee : x.tuition) || 0;
-            data.push([i+1, x.name, x.regId||'', x.isSib?'أخ/أخت':'', x.ph||'', payments.length, totalFee-paid]);
+            data.push([i+1, x.name, x.regId||'', x.isSib?'أخ/أخت':'', x.ph||'', payments.length, paid, totalFee-paid]);
         });
-        let wb = XLSX.utils.book_new(); 
+        let wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), "تقرير السائق"); 
         XLSX.writeFile(wb, `خط_${reg.driver}.xlsx`); 
     } catch(e) { customAlert("تأكد من توفر الاتصال بالإنترنت لتحميل ملف الإكسل", "error"); }
@@ -1542,10 +1850,10 @@ function printReceipt() {
     let curYear = db.schoolDate || new Date().getFullYear();
 
     let sibs = s.siblings || [];
-    let b1 = sibs[0] || {}; let c1 = db.classes.find(x=>x.id==b1.classId);
-    let b2 = sibs[1] || {}; let c2 = db.classes.find(x=>x.id==b2.classId);
-    let b3 = sibs[2] || {}; let c3 = db.classes.find(x=>x.id==b3.classId);
-    let b4 = sibs[3] || {}; let c4 = db.classes.find(x=>x.id==b4.classId);
+    let b1 = sibs[0] || {}; let c1 = db.classes.find(x=>x.id==b1.classId); let sc1 = c1 ? c1.sections.find(x=>x.id==b1.sectionId) : null;
+    let b2 = sibs[1] || {}; let c2 = db.classes.find(x=>x.id==b2.classId); let sc2 = c2 ? c2.sections.find(x=>x.id==b2.sectionId) : null;
+    let b3 = sibs[2] || {}; let c3 = db.classes.find(x=>x.id==b3.classId); let sc3 = c3 ? c3.sections.find(x=>x.id==b3.sectionId) : null;
+    let b4 = sibs[3] || {}; let c4 = db.classes.find(x=>x.id==b4.classId); let sc4 = c4 ? c4.sections.find(x=>x.id==b4.sectionId) : null;
 
     let generateHalf = (title) => `
     <div class="receipt-print-container" style="border: 2px solid #000; padding: 10px; font-family: Arial, sans-serif; direction: rtl; width: 100%; box-sizing: border-box; height: 140mm; display: flex; flex-direction: column; justify-content: space-between; margin: 0 auto;">
@@ -1584,25 +1892,25 @@ function printReceipt() {
                 <td style="width: 15%; border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الأخ الأول</td>
                 <td style="width: 35%; border: 2px solid #000; padding: 3px;">${b1.name || ''}</td>
                 <td style="width: 15%; border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الصف</td>
-                <td style="width: 35%; border: 2px solid #000; padding: 3px;">${c1 ? c1.name : ''}</td>
+                <td style="width: 35%; border: 2px solid #000; padding: 3px;">${c1 ? c1.name : ''} ${sc1 ? sc1.name : ''}</td>
             </tr>
             <tr>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الأخ الثاني</td>
                 <td style="border: 2px solid #000; padding: 3px;">${b2.name || ''}</td>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الصف</td>
-                <td style="border: 2px solid #000; padding: 3px;">${c2 ? c2.name : ''}</td>
+                <td style="border: 2px solid #000; padding: 3px;">${c2 ? c2.name : ''} ${sc2 ? sc2.name : ''}</td>
             </tr>
             <tr>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الأخ الثالث</td>
                 <td style="border: 2px solid #000; padding: 3px;">${b3.name || ''}</td>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الصف</td>
-                <td style="border: 2px solid #000; padding: 3px;">${c3 ? c3.name : ''}</td>
+                <td style="border: 2px solid #000; padding: 3px;">${c3 ? c3.name : ''} ${sc3 ? sc3.name : ''}</td>
             </tr>
             <tr>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الأخ الرابع</td>
                 <td style="border: 2px solid #000; padding: 3px;">${b4.name || ''}</td>
                 <td style="border: 2px solid #000; background: rgba(0,0,0,0.05); padding: 3px;">الصف</td>
-                <td style="border: 2px solid #000; padding: 3px;">${c4 ? c4.name : ''}</td>
+                <td style="border: 2px solid #000; padding: 3px;">${c4 ? c4.name : ''} ${sc4 ? sc4.name : ''}</td>
             </tr>
         </table>
 
