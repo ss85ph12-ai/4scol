@@ -8,12 +8,12 @@
     <meta name="theme-color" content="#a777e3">
     <link rel="apple-touch-icon" href="./icon-192x192.png">
     
-    <link rel="stylesheet" href="style.css?v=v18">
+    <link rel="stylesheet" href="style.css?v=v6">
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
     
-    <script src="config.js"></script>
+    <script src="config.js?v=v6"></script>
 
     <script type="module">
       import { initializeApp } from "https://www.gstatic.com/firebasejs/12.14.0/firebase-app.js";
@@ -138,13 +138,19 @@
         <div id="tab-reports" class="tab-content">
             <div class="glass p-3 mb-3 pb-x">
                 <h3><i class="fas fa-file-excel"></i> التقارير والقوائم</h3>
+                <div class="mt-1 mb-2">
+                    <label for="rep-student-search" class="text-right w-100">بحث الطالب (اكتب من أول حرف، من دون اختيار صف أو شعبة)</label>
+                    <input id="rep-student-search" class="glass-input m-0" type="search" autocomplete="off" placeholder="ابحث باسم الطالب أو رقم القيد..." oninput="searchReportStudents()">
+                    <div id="rep-student-results" class="report-search-results" role="listbox" aria-label="نتائج بحث الطلاب"></div>
+                    <div id="rep-selected-student" class="report-selected-student"></div>
+                </div>
                 <div class="grid-3 mt-1 mb-2">
                     <select id="rep-class" class="glass-input m-0" onchange="updateRepSectionDropdown()"></select>
                     <select id="rep-section" class="glass-input m-0" onchange="generateReport()"><option value="">اختر الشعبة</option></select>
                     <select id="rep-driver" class="glass-input m-0" onchange="generateDriverReport()"><option value="">اختر خط النقل</option></select>
                 </div>
                 <div class="grid-2 mb-2">
-                    <button type="button" class="btn-3d success w-100" onclick="exportReportExcel()"><i class="fas fa-download"></i> كشف الصف (إكسل)</button>
+                    <button type="button" class="btn-3d success w-100" onclick="exportReportExcel()"><i class="fas fa-download"></i> كشف الطلاب (إكسل)</button>
                     <button type="button" class="btn-3d warning w-100" onclick="exportDriverExcel()"><i class="fas fa-bus"></i> كشف السائق (إكسل)</button>
                 </div>
                 <div id="report-list" class="list-container"></div>
@@ -507,27 +513,39 @@
     </div>
 
     <div id="print-area"></div>
-    <script src="script.js?v=v18"></script>
+    <script src="script.js?v=v6"></script>
     
     <script>
-      let newWorker;
+      let newWorker = null;
+      let reloadAfterUpdate = false;
+      function showUpdatePrompt(worker) {
+        newWorker = worker;
+        document.getElementById('pwa-update-bar')?.classList.add('show');
+      }
       if ('serviceWorker' in navigator) {
         window.addEventListener('load', () => {
-          navigator.serviceWorker.register('./sw.js').then(reg => {
+          navigator.serviceWorker.register('./sw.js?v=' + encodeURIComponent(APP_CONFIG.APP_VERSION), {updateViaCache: 'none'}).then(reg => {
+            if (reg.waiting && navigator.serviceWorker.controller) showUpdatePrompt(reg.waiting);
             reg.addEventListener('updatefound', () => {
               newWorker = reg.installing;
+              if (!newWorker) return;
               newWorker.addEventListener('statechange', () => {
                 if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
-                  document.getElementById('pwa-update-bar').classList.add('show');
+                  showUpdatePrompt(newWorker);
                 }
               });
             });
-          });
+            reg.update().catch(error => console.warn('تعذر التحقق من تحديث التطبيق:', error));
+          }).catch(error => console.warn('تعذر تسجيل تحديث التطبيق:', error));
+        });
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (reloadAfterUpdate) window.location.reload();
         });
       }
       function reloadForUpdate() {
-        if(newWorker) newWorker.postMessage('SKIP_WAITING');
-        window.location.reload();
+        if (!newWorker) { window.location.reload(); return; }
+        reloadAfterUpdate = true;
+        newWorker.postMessage('SKIP_WAITING');
       }
     </script>
 </body>

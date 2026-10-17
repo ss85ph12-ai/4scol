@@ -243,44 +243,68 @@ document.getElementById('trigger-install-modal').addEventListener('click', () =>
     showModal('pwa-install-modal');
 });
 
-async function startApp() {
-    let metaKey = APP_CONFIG.DB_KEY + "_meta";
-    
-    if (window.firebaseReady && window.fsDb) {
-        try {
-            const metaRef = window.fsDoc(window.fsDb, "schools", metaKey);
-            const metaSnap = await window.fsGetDoc(metaRef);
-            if (metaSnap.exists()) {
-                let metaData = metaSnap.data();
-                allYears = metaData.years || [];
-                localStorage.setItem(APP_CONFIG.DB_KEY + '_allYears', JSON.stringify(allYears));
-            } else {
-                const oldRef = window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY);
-                const oldSnap = await window.fsGetDoc(oldRef);
-                if(oldSnap.exists()) {
-                    let oldDb = oldSnap.data();
-                    let y = oldDb.schoolDate || '2025-2026';
-                    allYears = [y];
-                    await window.fsSetDoc(metaRef, {years: allYears});
-                    await window.fsSetDoc(window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + y), oldDb);
-                }
-            }
-        } catch(e) { console.error(e); }
-    }
+let appStartupRunning = false;
+let appHasStarted = false;
 
-    if(allYears.length === 0) {
-        try { allYears = JSON.parse(localStorage.getItem(APP_CONFIG.DB_KEY + '_allYears')); } catch(e){}
-        if(!allYears || allYears.length === 0) {
-            let oldDbLocal = null;
-            try { oldDbLocal = JSON.parse(localStorage.getItem(APP_CONFIG.DB_KEY)); } catch(e){}
-            if(oldDbLocal) {
-                let y = oldDbLocal.schoolDate || '2025-2026';
+function showFirebaseStartupError(message = 'لم نتمكن من قراءة البيانات من Firebase. لم يتم فتح نموذج إعداد مدرسة جديدة حتى لا تُحفظ بيانات فارغة فوق السجلات الموجودة.') {
+    const modal = document.getElementById('setup-modal');
+    if (!modal) return;
+    modal.innerHTML = `
+        <div class="modal-content glass text-center">
+            <h2><i class="fas fa-triangle-exclamation"></i> تعذر تحميل بيانات المدرسة</h2>
+            <p>${message}</p>
+            <button type="button" class="btn-3d success w-100 mt-2" onclick="window.location.reload()"><i class="fas fa-sync"></i> إعادة المحاولة</button>
+        </div>`;
+    modal.classList.add('active');
+    document.getElementById('app')?.classList.add('hidden');
+}
+
+async function startApp() {
+    if (appStartupRunning || appHasStarted) return;
+    if (!window.firebaseReady || !window.fsDb) {
+        showFirebaseStartupError();
+        return;
+    }
+    appStartupRunning = true;
+    try {
+    let metaKey = APP_CONFIG.DB_KEY + "_meta";
+    let metaRef, metaSnap, isNewSchool = false;
+    try {
+        metaRef = window.fsDoc(window.fsDb, "schools", metaKey);
+        metaSnap = await window.fsGetDoc(metaRef);
+        if (metaSnap.exists()) {
+            const metaData = metaSnap.data();
+            allYears = Array.isArray(metaData.years) ? metaData.years.filter(y => typeof y === 'string' && y.trim()) : [];
+            if (allYears.length === 0) {
+                showFirebaseStartupError();
+                return;
+            }
+            localStorage.setItem(APP_CONFIG.DB_KEY + '_allYears', JSON.stringify(allYears));
+        } else {
+            const oldRef = window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY);
+            const oldSnap = await window.fsGetDoc(oldRef);
+            if (oldSnap.exists()) {
+                const oldDb = oldSnap.data();
+                const y = oldDb.schoolDate || '2025-2026';
+                let legacyCache = null;
+                try { legacyCache = JSON.parse(localStorage.getItem(APP_CONFIG.DB_KEY + '_' + y)); } catch(e) {}
+                if (!Array.isArray(oldDb.students) || !Array.isArray(oldDb.classes) || (oldDb.students.length === 0 && Array.isArray(legacyCache?.students) && legacyCache.students.length > 0)) {
+                    showFirebaseStartupError('بيانات المدرسة القديمة ناقصة أو فارغة، وتوجد نسخة محلية قديمة. أوقفنا الترحيل حتى لا تُستبدل بيانات الطلاب.');
+                    return;
+                }
                 allYears = [y];
-                localStorage.setItem(APP_CONFIG.DB_KEY + '_' + y, JSON.stringify(oldDbLocal));
+                await window.fsSetDoc(metaRef, { years: allYears });
+                await window.fsSetDoc(window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + y), oldDb);
+            } else {
+                allYears = [];
+                isNewSchool = true;
             }
         }
+    } catch (e) {
+        console.error("تعذر قراءة فهرس السنوات من Firebase:", e);
+        showFirebaseStartupError();
+        return;
     }
-    if(!allYears || allYears.length === 0) allYears = [];
 
     currentYear = localStorage.getItem(APP_CONFIG.DB_KEY + '_currentYear');
     if(!currentYear || !allYears.includes(currentYear)) {
@@ -289,25 +313,38 @@ async function startApp() {
         if(currentYear) localStorage.setItem(APP_CONFIG.DB_KEY + '_currentYear', currentYear);
     }
 
-    if (currentYear && window.firebaseReady && window.fsDb) {
+    if (currentYear) {
         try {
             const docRef = window.fsDoc(window.fsDb, "schools", APP_CONFIG.DB_KEY + "_" + currentYear);
             const docSnap = await window.fsGetDoc(docRef);
-            if (docSnap.exists()) {
-                db = docSnap.data(); 
-                localStorage.setItem(APP_CONFIG.DB_KEY + "_" + currentYear, JSON.stringify(db));
+            if (!docSnap.exists()) {
+                showFirebaseStartupError();
+                return;
             }
+            const cloudDb = docSnap.data();
+            const storageKey = APP_CONFIG.DB_KEY + "_" + currentYear;
+            let cachedDb = null;
+            try { cachedDb = JSON.parse(localStorage.getItem(storageKey)); } catch(e) {}
+            const cloudHasCoreData = cloudDb && typeof cloudDb === 'object' && Array.isArray(cloudDb.students) && Array.isArray(cloudDb.classes);
+            const cacheHasStudents = cachedDb && Array.isArray(cachedDb.students) && cachedDb.students.length > 0;
+            if (!cloudHasCoreData || (cloudDb.students.length === 0 && cacheHasStudents) || (!cloudDb.schoolName && cachedDb?.schoolName)) {
+                showFirebaseStartupError('وصل رد فارغ أو ناقص من Firebase، بينما توجد نسخة محلية محفوظة. أوقفنا الفتح والحفظ كي لا تُستبدل السجلات. أعد المحاولة أو استرجع نسخة احتياطية بعد التحقق.');
+                return;
+            }
+            db = cloudDb;
+            localStorage.setItem(storageKey, JSON.stringify(db));
         } catch (e) {
-            console.error("خطأ", e);
+            console.error("تعذر قراءة بيانات السنة من Firebase:", e);
+            showFirebaseStartupError();
+            return;
         }
     }
-    
-    if(currentYear) {
-        try { db = JSON.parse(localStorage.getItem(APP_CONFIG.DB_KEY + "_" + currentYear)); } catch(e) { db = null; }
-    } else {
-        db = null;
+
+    if (!currentYear && !isNewSchool) {
+        showFirebaseStartupError();
+        return;
     }
-    
+
     if(!db || typeof db !== 'object') {
        db = {
             schoolName: '', schoolDate: currentYear, theme: 'light',
@@ -329,6 +366,10 @@ async function startApp() {
         document.getElementById('app').classList.remove('hidden'); 
         initApp(); 
     }
+    appHasStarted = true;
+    } finally {
+        appStartupRunning = false;
+    }
 }
 
 window.onload = () => {
@@ -336,7 +377,7 @@ window.onload = () => {
         startApp();
     } else {
         window.onFirebaseReady = startApp;
-        setTimeout(() => { if (!window.firebaseReady) startApp(); }, 3000);
+        setTimeout(() => { if (!window.firebaseReady && !appHasStarted) showFirebaseStartupError(); }, 8000);
     }
 };
 
@@ -399,6 +440,10 @@ window.addEventListener('online', () => {
 });
 
 function saveSetup() {
+    if (!window.firebaseReady || !window.fsDb) {
+        showFirebaseStartupError();
+        return;
+    }
     let name = document.getElementById('setup-school-name').value;
     let date = document.getElementById('setup-school-date').value;
     if(!date) date = new Date().getFullYear() + '-' + (new Date().getFullYear() + 1);
@@ -750,13 +795,15 @@ function renderSubjects() {
 function populateClassSelects() { 
     let opts = '<option value="">اختر الصف</option>'+db.classes.map(c=>`<option value="${c.id}">${c.name}</option>`).join(''); 
     ['std-class','sib-class','rep-class','prom-class','bulk-prom-from-class','bulk-prom-to-class'].forEach(id=>{ if(document.getElementById(id)) document.getElementById(id).innerHTML=opts; }); 
+    let repClass = document.getElementById('rep-class');
+    if(repClass) repClass.innerHTML = '<option value="">كل الصفوف (اختياري)</option>' + db.classes.map(c=>`<option value="${c.id}">${c.name}</option>`).join('');
     
-    let drvOpts = '<option value="">اختر خط النقل / السائق</option>'+db.regions.map(r=>`<option value="${r.code}">${r.name} - ${r.driver}</option>`).join('');
+    let drvOpts = '<option value="">اختر خط النقل (اختياري)</option>'+db.regions.map(r=>`<option value="${r.code}">${r.name} - ${r.driver}</option>`).join('');
     let drvEl = document.getElementById('rep-driver');
     if(drvEl) drvEl.innerHTML = drvOpts;
 }
-function updateSectionDropdown() { updateDropdown('std-class', 'std-section'); } function updateSibSectionDropdown() { updateDropdown('sib-class', 'sib-section'); } function updateRepSectionDropdown() { updateDropdown('rep-class', 'rep-section'); generateReport(); }
-function updateDropdown(cId, sId, sVal=null) { let v=document.getElementById(cId).value, sel=document.getElementById(sId); sel.innerHTML='<option value="">اختر الشعبة</option>'; let c=db.classes.find(x=>x.id==v); if(c){ sel.innerHTML+=c.sections.map(s=>`<option value="${s.id}">${s.name}</option>`).join(''); if(sVal) sel.value=sVal;} }
+function updateSectionDropdown() { updateDropdown('std-class', 'std-section'); } function updateSibSectionDropdown() { updateDropdown('sib-class', 'sib-section'); } function updateRepSectionDropdown() { updateDropdown('rep-class', 'rep-section', null, 'كل الشعب (اختياري)'); generateReport(); searchReportStudents(); }
+function updateDropdown(cId, sId, sVal=null, placeholder='اختر الشعبة') { let v=document.getElementById(cId).value, sel=document.getElementById(sId); sel.innerHTML=`<option value="">${placeholder}</option>`; let c=db.classes.find(x=>x.id==v); if(c){ sel.innerHTML+=c.sections.map(s=>`<option value="${s.id}">${s.name}</option>`).join(''); if(sVal) sel.value=sVal;} }
 function checkRegionCode() { let reg=db.regions.find(r=>r.code===document.getElementById('std-reg-code').value); document.getElementById('std-reg-name').value=reg?reg.name:''; document.getElementById('std-driver-name').value=reg?reg.driver:''; }
 
 function formatISODate(dateObj) {
@@ -1704,31 +1751,141 @@ function getFamilyReportPaidShare(mainStudent, memberIndex = 0) {
     return (baseCents + (memberIndex < extraCents ? 1 : 0)) / 100;
 }
 
+let reportStudentMatches = [];
+let selectedReportStudent = null;
+
+function escapeReportHtml(value) {
+    return String(value ?? '').replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+}
+
+function getReportStudentEntries() {
+    return (db.students || []).flatMap(main => [
+        {student:main, main, isSibling:false, memberIndex:0},
+        ...(main.siblings || []).map((student, index) => ({student, main, isSibling:true, memberIndex:index + 1}))
+    ]);
+}
+
+function getReportEntryClassAndSection(entry) {
+    let classData = db.classes.find(item => item.id == entry.student.classId);
+    let sectionData = classData?.sections?.find(item => item.id == entry.student.sectionId);
+    return {classData, sectionData};
+}
+
+function getFilteredReportStudentEntries() {
+    let cId = document.getElementById('rep-class').value;
+    let sId = document.getElementById('rep-section').value;
+    return getReportStudentEntries().filter(entry => (!cId || entry.student.classId == cId) && (!sId || entry.student.sectionId == sId));
+}
+
+function normalizeReportSearchText(value) {
+    return String(value || '').toLocaleLowerCase('ar')
+        .normalize('NFD').replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+        .replace(/[أإآٱ]/g, 'ا').replace(/\s+/g, ' ').trim();
+}
+
+function searchReportStudents() {
+    const input = document.getElementById('rep-student-search');
+    const results = document.getElementById('rep-student-results');
+    if (!input || !results) return;
+    const query = normalizeReportSearchText(input.value);
+    if (!query) {
+        reportStudentMatches = [];
+        selectedReportStudent = null;
+        document.getElementById('rep-selected-student').innerHTML = '';
+        results.innerHTML = '';
+        return;
+    }
+    const cId = document.getElementById('rep-class').value;
+    const sId = document.getElementById('rep-section').value;
+    const selectedOutsideFilters = selectedReportStudent && ((cId && selectedReportStudent.student.classId != cId) || (sId && selectedReportStudent.student.sectionId != sId));
+    if (selectedReportStudent && (query !== normalizeReportSearchText(selectedReportStudent.student.name) || selectedOutsideFilters)) {
+        selectedReportStudent = null;
+        document.getElementById('rep-selected-student').innerHTML = '';
+    }
+    reportStudentMatches = getFilteredReportStudentEntries().filter(entry =>
+        normalizeReportSearchText(entry.student.name).includes(query) ||
+        normalizeReportSearchText(entry.student.regId).includes(query)
+    ).slice(0, 30);
+    results.innerHTML = reportStudentMatches.length ? reportStudentMatches.map((entry, index) => {
+        const {classData, sectionData} = getReportEntryClassAndSection(entry);
+        return `<button type="button" role="option" class="report-search-option" onclick="selectReportStudent(${index})"><b>${escapeReportHtml(entry.student.name)}</b> ${entry.student.regId ? `<small>(قيد: ${escapeReportHtml(entry.student.regId)})</small>` : ''}<br><small>${escapeReportHtml(classData?.name || 'الصف غير محدد')} / ${escapeReportHtml(sectionData?.name || 'الشعبة غير محددة')}${entry.isSibling ? ` — أخ/أخت لـ ${escapeReportHtml(entry.main.name)}` : ''}</small></button>`;
+    }).join('') : '<div class="list-item text-center">ماكو طالب مطابق لهذا البحث</div>';
+}
+
+function selectReportStudent(index) {
+    selectedReportStudent = reportStudentMatches[index] || null;
+    if (!selectedReportStudent) return;
+    document.getElementById('rep-student-search').value = selectedReportStudent.student.name || '';
+    document.getElementById('rep-student-results').innerHTML = '';
+    renderSelectedReportStudent();
+}
+
+function renderSelectedReportStudent() {
+    const entry = selectedReportStudent;
+    const target = document.getElementById('rep-selected-student');
+    if (!entry || !target) return;
+    const {student, main, isSibling, memberIndex} = entry;
+    const {classData, sectionData} = getReportEntryClassAndSection(entry);
+    const fee = parseFloat(isSibling ? student.fee : student.tuition) || 0;
+    const paid = getFamilyReportPaidShare(main, memberIndex);
+    const region = db.regions.find(item => item.code === main.regionCode);
+    const details = [
+        `الصف: ${classData?.name || '-'}`,
+        `الشعبة: ${sectionData?.name || '-'}`,
+        `رقم القيد: ${student.regId || '-'}`,
+        `هاتف ولي الأمر: ${main.phone || '-'}`,
+        `القسط المقرر: ${fee.toLocaleString()} د.ع`,
+        `حصة الطالب من المدفوع: ${paid.toLocaleString()} د.ع`,
+        `المتبقي: ${(fee - paid).toLocaleString()} د.ع`,
+        `خط النقل: ${region?.name || '-'}`,
+        student.socialStatus ? `الحالة الاجتماعية: ${student.socialStatus}` : '',
+        student.notes ? `ملاحظات: ${student.notes}` : ''
+    ].filter(Boolean).map(escapeReportHtml).join(' | ');
+    target.innerHTML = `<div class="report-student-title"><i class="fas fa-user-graduate"></i> ${escapeReportHtml(student.name)} ${isSibling ? `<small>(أخ/أخت لـ ${escapeReportHtml(main.name)})</small>` : ''}</div><div class="report-student-meta">${details}</div><button type="button" class="btn-3d success btn-small mt-2" onclick="openSelectedReportStudentProfile()"><i class="fas fa-address-card"></i> فتح الملف المالي الكامل</button>`;
+}
+
+function openSelectedReportStudentProfile() {
+    if (selectedReportStudent?.main?.id != null) openProfile(selectedReportStudent.main.id);
+}
+
 function generateReport() {
-    let cId=document.getElementById('rep-class').value, sId=document.getElementById('rep-section').value; 
-    if(!cId||!sId){document.getElementById('report-list').innerHTML='';return;} 
-    let f=db.students.filter(s=>s.classId==cId && s.sectionId==sId).map(s=>({...s, isSib:false})); 
-    db.students.forEach(m=>{ (m.siblings||[]).forEach(sib=>{ if(sib.classId==cId && sib.sectionId==sId) f.push({name:sib.name, regId:sib.regId, isSib:true, mName:m.name}); }); }); 
-    f.sort((a,b)=>a.name.localeCompare(b.name,'ar')); 
-    document.getElementById('report-list').innerHTML=f.map((s,i)=>`<div class="list-item"><b>${i+1}.</b> ${s.name} ${s.regId?`<small>(قيد: ${s.regId})</small>`:''} ${s.isSib?`<small style="color:red;">(أخ لـ ${s.mName})</small>`:''}</div>`).join(''); 
+    const list = document.getElementById('report-list');
+    const cId = document.getElementById('rep-class').value;
+    const sId = document.getElementById('rep-section').value;
+    if (!cId && !sId) {
+        list.innerHTML = '<div class="text-center">ابحث باسم الطالب أعلاه، أو اختر صفاً أو شعبة اختيارياً لعرض القائمة.</div>';
+        return;
+    }
+    const entries = getFilteredReportStudentEntries().sort((a,b) => String(a.student.name || '').localeCompare(String(b.student.name || ''), 'ar'));
+    list.innerHTML = entries.map((entry,index) => {
+        const {classData, sectionData} = getReportEntryClassAndSection(entry);
+        return `<div class="list-item"><b>${index+1}.</b> ${escapeReportHtml(entry.student.name)} ${entry.student.regId ? `<small>(قيد: ${escapeReportHtml(entry.student.regId)})</small>` : ''} <small>${escapeReportHtml(classData?.name || '-')} / ${escapeReportHtml(sectionData?.name || '-')}</small> ${entry.isSibling ? `<small style="color:red;">(أخ لـ ${escapeReportHtml(entry.main.name)})</small>` : ''}</div>`;
+    }).join('') || '<div class="text-center">لا توجد أسماء ضمن الاختيارات الحالية</div>';
+    if (document.getElementById('rep-student-search')?.value) searchReportStudents();
 }
 
 function exportReportExcel() {
     try {
-        let cId=document.getElementById('rep-class').value, sId=document.getElementById('rep-section').value;
-        let c=db.classes.find(x=>x.id==cId), s=c?c.sections.find(x=>x.id==sId):null;
-        if(!c||!s) return customAlert('اختر الصف والشعبة', 'warning');
-        let f=db.students.filter(x=>x.classId==cId && x.sectionId==sId).map(x=>({...x, isSib:false, ph:x.phone, familyMain:x, familyMemberIndex:0}));
-        db.students.forEach(m=>{ (m.siblings||[]).forEach((sib,sibIndex)=>{ if(sib.classId==cId && sib.sectionId==sId) f.push({...sib, isSib:true, ph:m.phone, familyMain:m, familyMemberIndex:sibIndex+1}); }); });
-        f.sort((a,b)=>a.name.localeCompare(b.name,'ar'));
-        let data=[[`تقرير الصف: ${c.name} - الشعبة: ${s.name}`],["التسلسل","اسم الطالب","رقم القيد","ملاحظة","الموبايل","عدد الدفعات","حصة الطالب من المدفوع","المبلغ المتبقي"]];
-        f.forEach((x,i)=>{
-            let payments = Array.isArray(x.familyMain.payments) ? x.familyMain.payments : [];
-            let paid = getFamilyReportPaidShare(x.familyMain, x.familyMemberIndex);
-            let totalFee = parseFloat(x.isSib ? x.fee : x.tuition) || 0;
-            data.push([i+1, x.name, x.regId||'', x.isSib?'أخ/أخت':'', x.ph||'', payments.length, paid, totalFee-paid]);
+        const cId = document.getElementById('rep-class').value;
+        const sId = document.getElementById('rep-section').value;
+        let entries = getFilteredReportStudentEntries();
+        if (!cId && !sId && selectedReportStudent) entries = [selectedReportStudent];
+        entries.sort((a,b) => String(a.student.name || '').localeCompare(String(b.student.name || ''), 'ar'));
+        const c = db.classes.find(item => item.id == cId);
+        const s = c?.sections?.find(item => item.id == sId);
+        const scope = selectedReportStudent && entries.length === 1 && !cId && !sId ? `الطالب: ${selectedReportStudent.student.name}` : `كشف الطلاب${c ? ` - ${c.name}` : ''}${s ? ` - الشعبة ${s.name}` : ''}`;
+        const data = [[scope],["التسلسل","اسم الطالب","رقم القيد","الصف","الشعبة","ملاحظة","الموبايل","عدد الدفعات","حصة الطالب من المدفوع","المبلغ المتبقي"]];
+        entries.forEach((entry,index) => {
+            const {student,main,isSibling,memberIndex} = entry;
+            const {classData,sectionData} = getReportEntryClassAndSection(entry);
+            const payments = Array.isArray(main.payments) ? main.payments : [];
+            const paid = getFamilyReportPaidShare(main, memberIndex);
+            const fee = parseFloat(isSibling ? student.fee : student.tuition) || 0;
+            data.push([index+1, student.name||'', student.regId||'', classData?.name||'', sectionData?.name||'', isSibling ? `أخ/أخت لـ ${main.name}` : (student.notes||''), main.phone||'', payments.length, paid, fee-paid]);
         });
-        let wb=XLSX.utils.book_new(); XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), "التقرير"); XLSX.writeFile(wb, `تقرير_${c.name}_${s.name}.xlsx`);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), "التقرير");
+        XLSX.writeFile(wb, `تقرير_الطلاب${c ? `_${c.name}` : ''}${s ? `_${s.name}` : selectedReportStudent && entries.length === 1 ? `_${selectedReportStudent.student.name}` : ''}.xlsx`);
     } catch(e) { customAlert("تأكد من توفر الاتصال بالإنترنت لتحميل ملف الإكسل", "error"); }
 }
 

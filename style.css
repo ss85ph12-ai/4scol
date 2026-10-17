@@ -43,6 +43,13 @@ body { background: var(--bg-gradient); color: var(--text-color); min-height: 100
 }
 .glass-input:focus { box-shadow: 0 0 10px rgba(255,255,255,0.5); }
 body.dark-mode .glass-input { background: rgba(0,0,0,0.3); color: #fff; }
+.report-search-results:empty, .report-selected-student:empty { display: none; }
+.report-search-results { display: grid; gap: 6px; margin-top: 8px; max-height: 300px; overflow-y: auto; }
+.report-search-option { width: 100%; text-align: right; color: var(--text-color); background: var(--glass-bg); border: 1px solid var(--glass-border); border-radius: 10px; padding: 10px 12px; cursor: pointer; }
+.report-search-option:hover, .report-search-option:focus { outline: 2px solid #6e8efb; }
+.report-selected-student { margin-top: 10px; padding: 14px; border-radius: 12px; background: var(--glass-bg); border: 1px solid var(--glass-border); }
+.report-selected-student .report-student-title { font-size: 18px; font-weight: 800; margin-bottom: 8px; }
+.report-selected-student .report-student-meta { line-height: 1.9; }
 .pr-40 { padding-right: 40px !important; }
 .search-icon { position: absolute; right: 15px; top: 15px; color: #888; }
 
